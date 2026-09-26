@@ -88,7 +88,7 @@ def test_quota_cancel_retry_priority_and_batch_interventions(client):
     other = client.post("/api/compute/tasks", json=submit_payload("batch-other", user="other-user")).json()
     batch = client.post(
         "/api/compute/tasks/batch",
-        json={"task_ids": [one["id"], other["id"]], "operation": "priority", "actor": "administrator", "reason": "紧急算例", "priority": 99},
+        json={"task_ids": [one["id"], other["id"]], "operation": "priority", "actor": "administrator", "reason": "紧急算例", "priority": 55},
     )
     assert batch.status_code == 200
     assert len(batch.json()["succeeded"]) == 2

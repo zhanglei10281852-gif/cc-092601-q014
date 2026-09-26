@@ -66,6 +66,7 @@ class PriorityRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=2, max_length=1000)
     priority: int = Field(ge=0, le=100)
+    idempotency_key: str | None = Field(default=None, min_length=6, max_length=160)
 
 
 class BatchOperation(BaseModel):
@@ -80,3 +81,49 @@ class BatchOperation(BaseModel):
         if self.operation == "priority" and self.priority is None:
             raise ValueError("批量调整优先级时必须提供 priority")
         return self
+
+
+HighRiskAction = Literal["priority_boost", "batch_retry", "force_terminate", "result_withdraw"]
+
+
+class PolicyUpdate(BaseModel):
+    enabled: bool
+    priority_delta_threshold: int = Field(default=20, ge=0, le=100)
+    batch_size_threshold: int = Field(default=2, ge=1, le=200)
+    ttl_seconds: int = Field(default=3600, ge=60, le=604800)
+
+
+class InterventionRequestCreate(BaseModel):
+    action: HighRiskAction
+    task_ids: list[int] = Field(min_length=1, max_length=200)
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+    priority: int | None = Field(default=None, ge=0, le=100)
+    idempotency_key: str = Field(min_length=6, max_length=160)
+
+
+class DecisionRequest(BaseModel):
+    reviewer: str = Field(min_length=1, max_length=120)
+    reason: str = Field(default="", max_length=1000)
+
+
+class RejectRequest(BaseModel):
+    reviewer: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class RevokeRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(default="", max_length=1000)
+
+
+class ForceTerminateRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+    idempotency_key: str | None = Field(default=None, min_length=6, max_length=160)
+
+
+class WithdrawResultRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+    idempotency_key: str | None = Field(default=None, min_length=6, max_length=160)

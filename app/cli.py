@@ -5,18 +5,18 @@ import json
 
 from fastapi.testclient import TestClient
 
-from app.database import database_path, get_connection, init_db
+from app.database import database_path, get_connection, migrate_db
 from app.main import app
 
 
 def command_init() -> int:
-    init_db()
+    migrate_db()
     print(json.dumps({"database": str(database_path()), "status": "initialized"}, ensure_ascii=False))
     return 0
 
 
 def command_check() -> int:
-    init_db()
+    migrate_db()
     connection = get_connection()
     result = {
         "database": str(database_path()),

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import (
+    BatchOperation, CancelRequest, DecisionRequest, ForceTerminateRequest, InterventionRequestCreate,
+    PolicyUpdate, RejectRequest, RetryRequest, RevokeRequest, TaskClaim, TaskFailure, TaskResult,
+    TaskSubmit, TemplateCreate, PriorityRequest, QuotaSet, WithdrawResultRequest,
+)
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -74,12 +78,80 @@ def retry_task(task_id: int, payload: RetryRequest):
 
 @router.post("/tasks/{task_id}/priority")
 def set_priority(task_id: int, payload: PriorityRequest):
-    return service().set_priority(task_id, payload.actor, payload.reason, payload.priority)
+    return service().set_priority(task_id, payload.actor, payload.reason, payload.priority, idempotency_key=payload.idempotency_key)
+
+
+@router.post("/tasks/{task_id}/force-terminate")
+def force_terminate(task_id: int, payload: ForceTerminateRequest):
+    svc = service()
+    if payload.idempotency_key:
+        return svc.request_intervention(
+            {"action": "force_terminate", "task_ids": [task_id], "actor": payload.actor, "reason": payload.reason, "idempotency_key": payload.idempotency_key},
+            payload.actor,
+        )
+    return svc.force_terminate_request_or_execute(task_id, payload.actor, payload.reason)
+
+
+@router.post("/tasks/{task_id}/withdraw-result")
+def withdraw_result(task_id: int, payload: WithdrawResultRequest):
+    svc = service()
+    if payload.idempotency_key:
+        return svc.request_intervention(
+            {"action": "result_withdraw", "task_ids": [task_id], "actor": payload.actor, "reason": payload.reason, "idempotency_key": payload.idempotency_key},
+            payload.actor,
+        )
+    return svc.withdraw_result_request_or_execute(task_id, payload.actor, payload.reason)
 
 
 @router.post("/tasks/batch")
 def batch_operation(payload: BatchOperation):
     return service().batch_operation(payload.model_dump())
+
+
+# ----- 高风险干预审批策略 -----
+
+@router.get("/approval-policies")
+def list_approval_policies():
+    return {"items": service().list_approval_policies()}
+
+
+@router.put("/approval-policies/{action}")
+def update_approval_policy(action: str, payload: PolicyUpdate, actor: str = Query(..., min_length=1)):
+    return service().update_approval_policy(action, payload.model_dump(), actor)
+
+
+# ----- 高风险干预申请与复核 -----
+
+@router.post("/intervention-requests", status_code=201)
+def create_intervention_request(payload: InterventionRequestCreate):
+    data = payload.model_dump()
+    actor = data.pop("actor")
+    return service().request_intervention(data, actor)
+
+
+@router.get("/intervention-requests")
+def list_intervention_requests(status: str | None = None, action: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    return service().list_intervention_requests(status=status, action=action, limit=limit)
+
+
+@router.get("/intervention-requests/{request_id}")
+def get_intervention_request(request_id: int):
+    return service().get_intervention_request(request_id)
+
+
+@router.post("/intervention-requests/{request_id}/approve")
+def approve_intervention_request(request_id: int, payload: DecisionRequest):
+    return service().approve_request(request_id, payload.reviewer, payload.reason)
+
+
+@router.post("/intervention-requests/{request_id}/reject")
+def reject_intervention_request(request_id: int, payload: RejectRequest):
+    return service().reject_request(request_id, payload.reviewer, payload.reason)
+
+
+@router.post("/intervention-requests/{request_id}/revoke")
+def revoke_intervention_request(request_id: int, payload: RevokeRequest):
+    return service().revoke_request(request_id, payload.actor, payload.reason)
 
 
 @router.post("/recovery/expired-leases")

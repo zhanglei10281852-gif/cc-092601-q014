@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     parameter_digest TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
     idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','result_revoked')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
@@ -279,6 +279,8 @@ CREATE TABLE IF NOT EXISTS compute_results (
     result_digest TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    withdrawn_at TEXT,
+    withdraw_reason TEXT NOT NULL DEFAULT '',
     UNIQUE(task_id, version)
 );
 CREATE TABLE IF NOT EXISTS compute_interventions (
@@ -290,9 +292,72 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     before_json TEXT NOT NULL,
     after_json TEXT NOT NULL,
     batch_key TEXT NOT NULL DEFAULT '',
+    request_id INTEGER REFERENCES compute_intervention_requests(id),
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+-- 高风险人工干预的可配置审批策略
+CREATE TABLE IF NOT EXISTS compute_approval_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL UNIQUE CHECK(action IN ('priority_boost','batch_retry','force_terminate','result_withdraw')),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    priority_delta_threshold INTEGER NOT NULL DEFAULT 20 CHECK(priority_delta_threshold >= 0),
+    batch_size_threshold INTEGER NOT NULL DEFAULT 2 CHECK(batch_size_threshold >= 1),
+    ttl_seconds INTEGER NOT NULL DEFAULT 3600 CHECK(ttl_seconds > 0),
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- 高风险干预申请（带任务版本快照）
+CREATE TABLE IF NOT EXISTS compute_intervention_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL CHECK(action IN ('priority_boost','batch_retry','force_terminate','result_withdraw')),
+    requested_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','expired','revoked')),
+    expires_at TEXT NOT NULL,
+    decided_by TEXT NOT NULL DEFAULT '',
+    decided_at TEXT,
+    decision_reason TEXT NOT NULL DEFAULT '',
+    revoked_by TEXT NOT NULL DEFAULT '',
+    revoked_at TEXT,
+    executed_at TEXT,
+    batch_key TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_requests_status ON compute_intervention_requests(status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_idempotency ON compute_intervention_requests(requested_by, idempotency_key);
+
+-- 申请覆盖的任务及其版本/状态快照
+CREATE TABLE IF NOT EXISTS compute_intervention_request_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES compute_intervention_requests(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES compute_tasks(id) ON DELETE CASCADE,
+    task_version INTEGER NOT NULL,
+    task_status TEXT NOT NULL,
+    result_version INTEGER,
+    priority INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, task_id)
+);
+
+-- 复核决定（批准/驳回/过期/撤销），同一申请每种决定仅保留一条
+CREATE TABLE IF NOT EXISTS compute_intervention_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES compute_intervention_requests(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected','expired','revoked')),
+    decided_by TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, decision)
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_request ON compute_intervention_decisions(request_id, id);
 '''
 
 PERMISSIONS = [
@@ -311,6 +376,15 @@ PERMISSIONS = [
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+]
+
+
+DEFAULT_APPROVAL_POLICIES = [
+    # action, enabled, priority_delta_threshold, batch_size_threshold, ttl_seconds
+    ("priority_boost", 1, 20, 1, 3600),
+    ("batch_retry", 1, 0, 2, 3600),
+    ("force_terminate", 1, 0, 1, 1800),
+    ("result_withdraw", 1, 0, 1, 1800),
 ]
 
 
@@ -385,7 +459,76 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+        for action, enabled, priority_delta, batch_size, ttl in DEFAULT_APPROVAL_POLICIES:
+            connection.execute(
+                "INSERT OR IGNORE INTO compute_approval_policies(action,enabled,priority_delta_threshold,batch_size_threshold,ttl_seconds,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,'system',?,?)",
+                (action, enabled, priority_delta, batch_size, ttl, now, now),
+            )
 
 
 def migrate_db() -> None:
     init_db()
+    with transaction(immediate=True) as connection:
+        columns = {
+            "compute_results": {
+                "withdrawn_at": "TEXT",
+                "withdraw_reason": "TEXT NOT NULL DEFAULT ''",
+            },
+            "compute_interventions": {
+                "request_id": "INTEGER",
+            },
+        }
+        for table, additions in columns.items():
+            existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, declaration in additions.items():
+                if name not in existing:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        ddl = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='compute_tasks'").fetchone()
+        needs_rebuild = ddl is not None and "result_revoked" not in (ddl[0] or "")
+    if not needs_rebuild:
+        return
+    # 旧库的 compute_tasks 状态约束不含 result_revoked；SQLite 重建被引用表时必须先关闭外键
+    connection = get_connection()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            CREATE TABLE compute_tasks_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL REFERENCES compute_templates(id) ON DELETE RESTRICT,
+                project_code TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                parameters_json TEXT NOT NULL,
+                parameter_digest TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+                idempotency_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','result_revoked')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+                available_at TEXT NOT NULL,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_expires_at TEXT NOT NULL DEFAULT '',
+                current_result_version INTEGER,
+                last_error_code TEXT NOT NULL DEFAULT '',
+                last_error_message TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(requested_by, idempotency_key)
+            )
+            """
+        )
+        connection.execute("INSERT INTO compute_tasks_new SELECT * FROM compute_tasks")
+        connection.execute("DROP TABLE compute_tasks")
+        connection.execute("ALTER TABLE compute_tasks_new RENAME TO compute_tasks")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_queue ON compute_tasks(status,priority DESC,available_at,created_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_compute_tasks_owner ON compute_tasks(requested_by,status,created_at)")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")

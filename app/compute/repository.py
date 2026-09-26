@@ -77,11 +77,109 @@ class ComputeRepository:
     def interventions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_interventions WHERE task_id=? ORDER BY id", (task_id,)).fetchall()]
 
-    def add_intervention(self, *, task_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str) -> None:
+    def add_intervention(self, *, task_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str, request_id: int | None = None) -> None:
         self.connection.execute(
-            "INSERT INTO compute_interventions(task_id,actor,action,reason,before_json,after_json,batch_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (task_id, actor, action, reason, json.dumps(before, ensure_ascii=False, sort_keys=True), json.dumps(after, ensure_ascii=False, sort_keys=True), batch_key, now),
+            "INSERT INTO compute_interventions(task_id,actor,action,reason,before_json,after_json,batch_key,request_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (task_id, actor, action, reason, json.dumps(before, ensure_ascii=False, sort_keys=True), json.dumps(after, ensure_ascii=False, sort_keys=True), batch_key, request_id, now),
         )
+
+    # ----- 审批策略 -----
+
+    def list_approval_policies(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM compute_approval_policies ORDER BY id").fetchall()]
+
+    def approval_policy(self, action: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_approval_policies WHERE action=?", (action,)).fetchone()
+
+    def update_approval_policy(self, *, action: str, enabled: bool, priority_delta_threshold: int, batch_size_threshold: int, ttl_seconds: int, actor: str, now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "UPDATE compute_approval_policies SET enabled=?,priority_delta_threshold=?,batch_size_threshold=?,ttl_seconds=?,updated_by=?,updated_at=? WHERE action=?",
+            (1 if enabled else 0, priority_delta_threshold, batch_size_threshold, ttl_seconds, actor, now, action),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(action)
+        return dict(self.approval_policy(action))
+
+    # ----- 高风险干预申请 -----
+
+    def create_request(self, *, action: str, requested_by: str, reason: str, payload: dict[str, Any], snapshot_digest: str, idempotency_key: str, expires_at: str, now: str) -> int:
+        cursor = self.connection.execute(
+            "INSERT INTO compute_intervention_requests(action,requested_by,reason,payload_json,snapshot_digest,idempotency_key,status,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',?,?,?)",
+            (action, requested_by, reason, json.dumps(payload, ensure_ascii=False, sort_keys=True), snapshot_digest, idempotency_key, expires_at, now, now),
+        )
+        return int(cursor.lastrowid)
+
+    def add_request_task(self, *, request_id: int, task_id: int, task_version: int, task_status: str, result_version: int | None, priority: int, now: str) -> None:
+        self.connection.execute(
+            "INSERT INTO compute_intervention_request_tasks(request_id,task_id,task_version,task_status,result_version,priority,created_at) VALUES(?,?,?,?,?,?,?)",
+            (request_id, task_id, task_version, task_status, result_version, priority, now),
+        )
+
+    def request_by_id(self, request_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_intervention_requests WHERE id=?", (request_id,)).fetchone()
+
+    def request_by_idempotency(self, requested_by: str, key: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_intervention_requests WHERE requested_by=? AND idempotency_key=?", (requested_by, key)).fetchone()
+
+    def request_tasks(self, request_id: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM compute_intervention_request_tasks WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
+
+    def requests_for_task(self, task_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT r.* FROM compute_intervention_requests r JOIN compute_intervention_request_tasks rt ON rt.request_id=r.id WHERE rt.task_id=? ORDER BY r.id",
+            (task_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def request_decisions(self, request_id: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM compute_intervention_decisions WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
+
+    def list_requests(self, *, status: str | None, action: str | None, limit: int) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if status:
+            clauses.append("status=?")
+            values.append(status)
+        if action:
+            clauses.append("action=?")
+            values.append(action)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        values.append(limit)
+        return [dict(row) for row in self.connection.execute(
+            "SELECT * FROM compute_intervention_requests" + where + " ORDER BY id DESC LIMIT ?", values,
+        ).fetchall()]
+
+    def expire_requests(self, now: str) -> list[int]:
+        rows = self.connection.execute(
+            "SELECT id FROM compute_intervention_requests WHERE status='pending' AND expires_at<=? ORDER BY id",
+            (now,),
+        ).fetchall()
+        expired = [int(row["id"]) for row in rows]
+        for request_id in expired:
+            self.connection.execute(
+                "UPDATE compute_intervention_requests SET status='expired',decided_by='system:ttl',decided_at=?,updated_at=? WHERE id=? AND status='pending'",
+                (now, now, request_id),
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO compute_intervention_decisions(request_id,decision,decided_by,reason,created_at) VALUES(?,'expired','system:ttl','申请已超过有效期',?)",
+                (request_id, now),
+            )
+        return expired
+
+    def mark_request(self, request_id: int, *, status: str, decided_by: str, decided_at: str, decision_reason: str = "", batch_key: str = "", executed_at: str | None = None) -> None:
+        self.connection.execute(
+            "UPDATE compute_intervention_requests SET status=?,decided_by=?,decided_at=?,decision_reason=?,batch_key=COALESCE(NULLIF(?,''),batch_key),executed_at=COALESCE(?,executed_at),updated_at=? WHERE id=?",
+            (status, decided_by, decided_at, decision_reason, batch_key, executed_at, decided_at, request_id),
+        )
+
+    def add_decision(self, *, request_id: int, decision: str, decided_by: str, reason: str, now: str) -> None:
+        self.connection.execute(
+            "INSERT INTO compute_intervention_decisions(request_id,decision,decided_by,reason,created_at) VALUES(?,?,?,?,?)",
+            (request_id, decision, decided_by, reason, now),
+        )
+
+    def interventions_by_request(self, request_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute("SELECT * FROM compute_interventions WHERE request_id=? ORDER BY id", (request_id,)).fetchall()
 
     def list_tasks(self, *, status: str | None, project_code: str | None, requested_by: str | None, limit: int) -> list[dict[str, Any]]:
         clauses: list[str] = []

@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import audit, auth, departments_admin, maintenance, metrics, roles, system, users, workflow
 from app.core.errors import DomainError
-from app.database import close_connection, init_db
+from app.database import close_connection, migrate_db
 from app.routers import affairs, announcements, departments, petitions, residents
 from app.seismic.router import router as seismic_router
 from app.seismic.service import ensure_schema as ensure_seismic_schema
@@ -17,7 +17,7 @@ from app.compute.router import router as compute_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    init_db()
+    migrate_db()
     ensure_seismic_schema()
     yield
     close_connection()
