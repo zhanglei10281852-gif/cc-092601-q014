@@ -279,6 +279,9 @@ CREATE TABLE IF NOT EXISTS compute_results (
     result_digest TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    withdrawn_at TEXT NOT NULL DEFAULT '',
+    withdrawn_by TEXT NOT NULL DEFAULT '',
+    withdraw_reason TEXT NOT NULL DEFAULT '',
     UNIQUE(task_id, version)
 );
 CREATE TABLE IF NOT EXISTS compute_interventions (
@@ -293,6 +296,36 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE INDEX IF NOT EXISTS idx_compute_interventions_batch ON compute_interventions(batch_key,id);
+CREATE TABLE IF NOT EXISTS compute_approval_policy (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    priority_threshold INTEGER NOT NULL DEFAULT 100 CHECK(priority_threshold BETWEEN 0 AND 100),
+    batch_retry_min_size INTEGER NOT NULL DEFAULT 2 CHECK(batch_retry_min_size >= 1),
+    force_terminate_requires_approval INTEGER NOT NULL DEFAULT 1 CHECK(force_terminate_requires_approval IN (0,1)),
+    result_withdraw_requires_approval INTEGER NOT NULL DEFAULT 1 CHECK(result_withdraw_requires_approval IN (0,1)),
+    request_ttl_seconds INTEGER NOT NULL DEFAULT 3600 CHECK(request_ttl_seconds >= 60),
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS compute_approval_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL CHECK(action IN ('priority','batch_retry','force_terminate','result_withdraw')),
+    applicant TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    task_refs_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','expired','revoked','stale')),
+    decision_actor TEXT NOT NULL DEFAULT '',
+    decision_reason TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    execution_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compute_approvals_status ON compute_approval_requests(status,created_at);
+CREATE INDEX IF NOT EXISTS idx_compute_approvals_applicant ON compute_approval_requests(applicant,created_at);
 '''
 
 PERMISSIONS = [
@@ -359,10 +392,24 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """为早期版本创建的表补充新增列，保持旧数据库文件可用。"""
+    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_column(connection, "compute_results", "withdrawn_at", "withdrawn_at TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "compute_results", "withdrawn_by", "withdrawn_by TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "compute_results", "withdraw_reason", "withdraw_reason TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            "INSERT OR IGNORE INTO compute_approval_policy(id,priority_threshold,batch_retry_min_size,force_terminate_requires_approval,result_withdraw_requires_approval,request_ttl_seconds,updated_by,created_at,updated_at) VALUES(1,100,2,1,1,3600,'system',?,?)",
+            (now, now),
+        )
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

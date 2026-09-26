@@ -1,8 +1,24 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import (
+    ApprovalActor,
+    ApprovalDecision,
+    ApprovalPolicyUpdate,
+    BatchOperation,
+    CancelRequest,
+    ForceTerminateRequest,
+    PriorityRequest,
+    QuotaSet,
+    RetryRequest,
+    TaskClaim,
+    TaskFailure,
+    TaskResult,
+    TaskSubmit,
+    TemplateCreate,
+    WithdrawResultRequest,
+)
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -10,6 +26,12 @@ router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
 
 def service() -> ComputeOperationsService:
     return ComputeOperationsService()
+
+
+def _maybe_accepted(outcome: dict, response: Response) -> dict:
+    if isinstance(outcome, dict) and outcome.get("approval_required"):
+        response.status_code = 202
+    return outcome
 
 
 @router.get("/templates")
@@ -73,13 +95,23 @@ def retry_task(task_id: int, payload: RetryRequest):
 
 
 @router.post("/tasks/{task_id}/priority")
-def set_priority(task_id: int, payload: PriorityRequest):
-    return service().set_priority(task_id, payload.actor, payload.reason, payload.priority)
+def set_priority(task_id: int, payload: PriorityRequest, response: Response):
+    return _maybe_accepted(service().set_priority(task_id, payload.actor, payload.reason, payload.priority), response)
+
+
+@router.post("/tasks/{task_id}/force-terminate")
+def force_terminate(task_id: int, payload: ForceTerminateRequest, response: Response):
+    return _maybe_accepted(service().force_terminate(task_id, payload.actor, payload.reason), response)
+
+
+@router.post("/tasks/{task_id}/withdraw-result")
+def withdraw_result(task_id: int, payload: WithdrawResultRequest, response: Response):
+    return _maybe_accepted(service().withdraw_result(task_id, payload.actor, payload.reason, payload.result_version), response)
 
 
 @router.post("/tasks/batch")
-def batch_operation(payload: BatchOperation):
-    return service().batch_operation(payload.model_dump())
+def batch_operation(payload: BatchOperation, response: Response):
+    return _maybe_accepted(service().batch_operation(payload.model_dump()), response)
 
 
 @router.post("/recovery/expired-leases")
@@ -90,3 +122,43 @@ def recover_expired(actor: str = Query(default="recovery-worker", min_length=1))
 @router.get("/summary")
 def summary():
     return service().summary()
+
+
+@router.get("/approval-policy")
+def get_approval_policy():
+    return service().get_policy()
+
+
+@router.put("/approval-policy")
+def update_approval_policy(payload: ApprovalPolicyUpdate, actor: str = Query(..., min_length=1)):
+    return service().update_policy(payload.model_dump(exclude_unset=True), actor)
+
+
+@router.get("/approvals")
+def list_approvals(status: str | None = None, applicant: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": service().list_requests(status=status, applicant=applicant, limit=limit)}
+
+
+@router.get("/approvals/{request_id}")
+def get_approval(request_id: int):
+    return service().get_request(request_id)
+
+
+@router.post("/approvals/{request_id}/decide")
+def decide_approval(request_id: int, payload: ApprovalDecision):
+    return service().decide(request_id, payload.approver, payload.decision, payload.reason)
+
+
+@router.post("/approvals/{request_id}/revoke")
+def revoke_approval(request_id: int, payload: ApprovalActor):
+    return service().revoke(request_id, payload.actor)
+
+
+@router.post("/approvals/{request_id}/rehearse")
+def rehearse_approval(request_id: int, payload: ApprovalActor):
+    return service().rehearse(request_id, payload.actor)
+
+
+@router.get("/approvals/{request_id}/audit")
+def approval_audit(request_id: int):
+    return service().approval_audit(request_id)

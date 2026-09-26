@@ -8,13 +8,69 @@ from typing import Any, Callable
 
 from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
 from app.database import get_connection, transaction
 
 
 def digest(value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+DEFAULT_APPROVAL_POLICY: dict[str, Any] = {
+    "id": 1,
+    "priority_threshold": 100,
+    "batch_retry_min_size": 2,
+    "force_terminate_requires_approval": 1,
+    "result_withdraw_requires_approval": 1,
+    "request_ttl_seconds": 3600,
+    "updated_by": "",
+    "created_at": "",
+    "updated_at": "",
+}
+
+# 审批申请执行时写入干预记录使用的动作名，与直接执行路径保持一致。
+EXECUTION_ACTION = {"priority": "priority", "batch_retry": "retry", "force_terminate": "force_terminate", "result_withdraw": "result_withdraw"}
+
+
+def _mutate_retry(connection: sqlite3.Connection, task: sqlite3.Row, now: str, priority: int | None = None) -> None:
+    if task["status"] not in {"failed", "cancelled"}:
+        raise ConflictError("只有失败或已取消任务可以人工重试")
+    chosen = task["priority"] if priority is None else priority
+    connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
+
+
+def _mutate_priority(connection: sqlite3.Connection, task: sqlite3.Row, now: str, priority: int) -> None:
+    if task["status"] not in {"queued", "running"}:
+        raise ConflictError("只有排队或运行中的任务可以调整优先级")
+    connection.execute("UPDATE compute_tasks SET priority=?,updated_at=?,version=version+1 WHERE id=?", (priority, now, task["id"]))
+
+
+def _mutate_cancel(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
+    if task["status"] not in {"queued", "running"}:
+        raise ConflictError("当前任务状态不允许取消")
+    status = "cancel_requested" if task["status"] == "running" else "cancelled"
+    connection.execute("UPDATE compute_tasks SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, task["id"]))
+
+
+def _mutate_force_terminate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
+    if task["status"] not in {"queued", "running", "cancel_requested"}:
+        raise ConflictError("当前任务状态不允许强制终止")
+    connection.execute("UPDATE compute_tasks SET status='cancelled',lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?", (now, now, task["id"]))
+
+
+def _mutate_result_withdraw(connection: sqlite3.Connection, task: sqlite3.Row, now: str, result_version: int, actor: str, reason: str) -> None:
+    if task["status"] != "succeeded" or task["current_result_version"] is None:
+        raise ConflictError("只有已成功且持有当前结果的任务可以撤回结果")
+    if int(task["current_result_version"]) != int(result_version):
+        raise ConflictError("撤回的结果版本必须与任务当前结果版本一致")
+    row = connection.execute("SELECT withdrawn_at FROM compute_results WHERE task_id=? AND version=?", (task["id"], result_version)).fetchone()
+    if row is None:
+        raise NotFoundError("结果版本不存在")
+    if row["withdrawn_at"]:
+        raise ConflictError("结果已经撤回")
+    connection.execute("UPDATE compute_results SET withdrawn_at=?,withdrawn_by=?,withdraw_reason=? WHERE task_id=? AND version=?", (now, actor, reason, task["id"], result_version))
+    connection.execute("UPDATE compute_tasks SET status='queued',current_result_version=NULL,available_at=?,finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (now, now, task["id"]))
 
 
 class ComputeOperationsService:
@@ -153,35 +209,64 @@ class ComputeOperationsService:
             return dict(repository.task_by_id(task_id))
 
     def cancel(self, task_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
-        return self._intervene(task_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
+        return self._intervene(task_id, actor, reason, "cancel", batch_key, _mutate_cancel)
 
     def retry(self, task_id: int, actor: str, reason: str, priority: int | None = None, batch_key: str = "") -> dict[str, Any]:
-        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"failed", "cancelled"}:
-                raise ConflictError("只有失败或已取消任务可以人工重试")
-            chosen = task["priority"] if priority is None else priority
-            connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
-        return self._intervene(task_id, actor, reason, "retry", batch_key, mutate)
+        return self._intervene(task_id, actor, reason, "retry", batch_key, lambda connection, task, now: _mutate_retry(connection, task, now, priority))
 
     def set_priority(self, task_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
-        def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-            if task["status"] not in {"queued", "running"}:
-                raise ConflictError("只有排队或运行中的任务可以调整优先级")
-            connection.execute("UPDATE compute_tasks SET priority=?,updated_at=?,version=version+1 WHERE id=?", (priority, now, task["id"]))
-        return self._intervene(task_id, actor, reason, "priority", batch_key, mutate)
+        policy = self.get_policy()
+        task = self.repository.task_by_id(task_id)
+        if task is None:
+            raise NotFoundError("计算任务不存在")
+        if priority > int(task["priority"]) and priority >= int(policy["priority_threshold"]):
+            request = self._create_request("priority", actor, reason, {"task_ids": [task_id], "priority": priority}, policy)
+            return {"approval_required": True, "request": request}
+        return self._intervene(task_id, actor, reason, "priority", batch_key, lambda connection, task, now: _mutate_priority(connection, task, now, priority))
+
+    def force_terminate(self, task_id: int, actor: str, reason: str) -> dict[str, Any]:
+        policy = self.get_policy()
+        if int(policy["force_terminate_requires_approval"]):
+            request = self._create_request("force_terminate", actor, reason, {"task_ids": [task_id]}, policy)
+            return {"approval_required": True, "request": request}
+        return self._intervene(task_id, actor, reason, "force_terminate", "", _mutate_force_terminate)
+
+    def withdraw_result(self, task_id: int, actor: str, reason: str, result_version: int) -> dict[str, Any]:
+        policy = self.get_policy()
+        if int(policy["result_withdraw_requires_approval"]):
+            request = self._create_request("result_withdraw", actor, reason, {"task_ids": [task_id], "result_version": result_version}, policy)
+            return {"approval_required": True, "request": request}
+        return self._intervene(task_id, actor, reason, "result_withdraw", "", lambda connection, task, now: _mutate_result_withdraw(connection, task, now, result_version, actor, reason))
 
     def batch_operation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        policy = self.get_policy()
+        operation = payload["operation"]
+        task_ids = list(dict.fromkeys(payload["task_ids"]))
+        if operation == "retry" and len(task_ids) >= int(policy["batch_retry_min_size"]):
+            request = self._create_request("batch_retry", payload["actor"], payload["reason"], {"task_ids": task_ids, "priority": payload.get("priority")}, policy)
+            return {"approval_required": True, "request": request}
+        if operation == "priority" and payload.get("priority") is not None and int(payload["priority"]) >= int(policy["priority_threshold"]):
+            target = int(payload["priority"])
+            promoted = False
+            for task_id in task_ids:
+                task = self.repository.task_by_id(task_id)
+                if task is not None and target > int(task["priority"]):
+                    promoted = True
+                    break
+            if promoted:
+                request = self._create_request("priority", payload["actor"], payload["reason"], {"task_ids": task_ids, "priority": target}, policy)
+                return {"approval_required": True, "request": request}
         batch_key = digest({"actor": payload["actor"], "task_ids": payload["task_ids"], "operation": payload["operation"], "reason": payload["reason"]})
         succeeded: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
-        for task_id in list(dict.fromkeys(payload["task_ids"])):
+        for task_id in task_ids:
             try:
-                if payload["operation"] == "cancel":
+                if operation == "cancel":
                     value = self.cancel(task_id, payload["actor"], payload["reason"], batch_key)
-                elif payload["operation"] == "retry":
+                elif operation == "retry":
                     value = self.retry(task_id, payload["actor"], payload["reason"], payload.get("priority"), batch_key)
                 else:
-                    value = self.set_priority(task_id, payload["actor"], payload["reason"], int(payload["priority"]), batch_key)
+                    value = self._intervene(task_id, payload["actor"], payload["reason"], "priority", batch_key, lambda connection, task, now: _mutate_priority(connection, task, now, int(payload["priority"])))
                 succeeded.append({"task_id": task_id, "status": value["status"], "version": value["version"]})
             except (ConflictError, NotFoundError) as exc:
                 failed.append({"task_id": task_id, "code": exc.code, "message": exc.message})
@@ -228,12 +313,224 @@ class ComputeOperationsService:
             repository.add_intervention(task_id=task_id, actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
             return after
 
+    def get_policy(self) -> dict[str, Any]:
+        row = self.repository.policy()
+        if row is None:
+            return dict(DEFAULT_APPROVAL_POLICY)
+        return dict(row)
+
+    def update_policy(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.ensure_policy(actor=actor, now=now)
+            if not payload:
+                row = repository.policy()
+                assert row is not None
+                return dict(row)
+            return repository.update_policy(fields=payload, actor=actor, now=now)
+
+    def list_requests(self, *, status: str | None = None, applicant: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.expire_requests(now=now)
+            rows = repository.list_requests(status=status, applicant=applicant, limit=max(1, min(limit, 500)))
+            return [self._request_view(row) for row in rows]
+
+    def get_request(self, request_id: int) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.expire_requests(now=now)
+            row = repository.request_by_id(request_id)
+            if row is None:
+                raise NotFoundError("审批申请不存在")
+            return self._request_view(row)
+
+    def decide(self, request_id: int, approver: str, decision: str, reason: str = "") -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        stale = False
+        view: dict[str, Any] | None = None
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.expire_requests(now=now)
+            request = repository.request_by_id(request_id)
+            if request is None:
+                raise NotFoundError("审批申请不存在")
+            if request["status"] in {"approved", "rejected"}:
+                return {"request": self._request_view(request), "duplicate": True}
+            if request["status"] == "expired":
+                raise ConflictError("申请已过期，无法复核")
+            if request["status"] == "revoked":
+                raise ConflictError("申请已被申请人撤销，无法复核")
+            if request["status"] == "stale":
+                raise ConflictError("任务快照已过期，需要重新预演后才能复核")
+            if approver == request["applicant"]:
+                raise PermissionDeniedError("申请人与复核人必须分离")
+            if decision == "reject":
+                if not reason.strip():
+                    raise ValidationError("驳回申请必须填写原因")
+                repository.decide_request(request_id=request_id, status="rejected", actor=approver, reason=reason, decided_at=now, execution=None, now=now)
+            else:
+                refs = json.loads(request["task_refs_json"])
+                fresh = True
+                for ref in refs:
+                    task = repository.task_by_id(int(ref["task_id"]))
+                    if task is None or int(task["version"]) != int(ref["version"]):
+                        fresh = False
+                        break
+                if not fresh:
+                    repository.update_request_status(request_id=request_id, status="stale", now=now)
+                    stale = True
+                else:
+                    payload = json.loads(request["payload_json"])
+                    intervention_ids: list[int] = []
+                    tasks_after: list[dict[str, Any]] = []
+                    for ref in refs:
+                        task_id = int(ref["task_id"])
+                        task = repository.task_by_id(task_id)
+                        assert task is not None
+                        before = dict(task)
+                        self._apply_mutation(connection, task, request["action"], payload, now, approver, request["reason"])
+                        after = dict(repository.task_by_id(task_id))
+                        intervention_id = repository.add_intervention(
+                            task_id=task_id, actor=approver, action=EXECUTION_ACTION[request["action"]],
+                            reason=request["reason"], before=before, after=after, batch_key=f"approval:{request_id}", now=now,
+                        )
+                        intervention_ids.append(intervention_id)
+                        tasks_after.append({"task_id": task_id, "status": after["status"], "version": after["version"]})
+                    execution = {"intervention_ids": intervention_ids, "tasks": tasks_after, "executed_at": now}
+                    repository.decide_request(request_id=request_id, status="approved", actor=approver, reason=reason, decided_at=now, execution=execution, now=now)
+            view = self._request_view(repository.request_by_id(request_id))
+        if stale:
+            raise ConflictError("任务在等待期间发生变化，申请已转为快照过期状态，需要重新预演", context={"request_id": request_id, "status": "stale"})
+        assert view is not None
+        return {"request": view, "duplicate": False}
+
+    def revoke(self, request_id: int, actor: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.expire_requests(now=now)
+            request = repository.request_by_id(request_id)
+            if request is None:
+                raise NotFoundError("审批申请不存在")
+            if actor != request["applicant"]:
+                raise PermissionDeniedError("只有申请人可以撤销申请")
+            if request["status"] == "revoked":
+                return self._request_view(request)
+            if request["status"] in {"approved", "rejected"}:
+                raise ConflictError("申请已完成复核，无法撤销")
+            if request["status"] == "expired":
+                raise ConflictError("申请已过期，无需撤销")
+            repository.update_request_status(request_id=request_id, status="revoked", now=now)
+            return self._request_view(repository.request_by_id(request_id))
+
+    def rehearse(self, request_id: int, actor: str) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.expire_requests(now=now)
+            request = repository.request_by_id(request_id)
+            if request is None:
+                raise NotFoundError("审批申请不存在")
+            if actor != request["applicant"]:
+                raise PermissionDeniedError("只有申请人可以重新预演申请")
+            if request["status"] not in {"pending", "stale"}:
+                raise ConflictError("当前状态不允许重新预演")
+            policy_row = repository.policy()
+            policy = dict(policy_row) if policy_row is not None else dict(DEFAULT_APPROVAL_POLICY)
+            payload = json.loads(request["payload_json"])
+            task_ids = [int(ref["task_id"]) for ref in json.loads(request["task_refs_json"])]
+            self._rehearse(connection, repository, request["action"], payload, task_ids, now, actor, request["reason"])
+            refs = self._snapshot(repository, task_ids)
+            expires = to_storage(now_value + timedelta(seconds=int(policy["request_ttl_seconds"])))
+            repository.refresh_request_rehearsal(request_id=request_id, task_refs=refs, expires_at=expires, now=now)
+            return self._request_view(repository.request_by_id(request_id))
+
+    def approval_audit(self, request_id: int) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            repository.expire_requests(now=now)
+            row = repository.request_by_id(request_id)
+            if row is None:
+                raise NotFoundError("审批申请不存在")
+            request = self._request_view(row)
+            interventions = repository.interventions_by_batch_key(f"approval:{request_id}")
+            tasks: list[dict[str, Any]] = []
+            for ref in request["task_refs"]:
+                task = repository.task_by_id(int(ref["task_id"]))
+                if task is not None:
+                    tasks.append(dict(task))
+            decision: dict[str, Any] | None = None
+            if request["status"] in {"approved", "rejected"}:
+                decision = {"outcome": request["status"], "actor": request["decision_actor"], "reason": request["decision_reason"], "at": request["decided_at"]}
+            elif request["status"] == "revoked":
+                decision = {"outcome": "revoked", "actor": request["applicant"], "reason": "", "at": request["updated_at"]}
+            elif request["status"] == "expired":
+                decision = {"outcome": "expired", "actor": "system", "reason": "申请超过有效期未复核", "at": request["expires_at"]}
+            return {"request": request, "decision": decision, "interventions": interventions, "tasks": tasks}
+
+    def _create_request(self, action: str, applicant: str, reason: str, payload: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        expires = to_storage(now_value + timedelta(seconds=int(policy["request_ttl_seconds"])))
+        task_ids = [int(task_id) for task_id in payload["task_ids"]]
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            self._rehearse(connection, repository, action, payload, task_ids, now, applicant, reason)
+            refs = self._snapshot(repository, task_ids)
+            row = repository.create_request(action=action, applicant=applicant, reason=reason, payload=payload, task_refs=refs, expires_at=expires, now=now)
+            return self._request_view(row)
+
+    def _rehearse(self, connection: sqlite3.Connection, repository: ComputeRepository, action: str, payload: dict[str, Any], task_ids: list[int], now: str, actor: str, reason: str) -> None:
+        """在保存点内试跑真实变更逻辑验证可行性，随后回滚，不落任何数据。"""
+        connection.execute("SAVEPOINT approval_rehearsal")
+        try:
+            for task_id in task_ids:
+                task = repository.task_by_id(task_id)
+                if task is None:
+                    raise NotFoundError(f"计算任务 {task_id} 不存在")
+                self._apply_mutation(connection, task, action, payload, now, actor, reason)
+        finally:
+            connection.execute("ROLLBACK TO approval_rehearsal")
+            connection.execute("RELEASE approval_rehearsal")
+
     @staticmethod
-    def _cancel_mutation(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-        if task["status"] not in {"queued", "running"}:
-            raise ConflictError("当前任务状态不允许取消")
-        status = "cancel_requested" if task["status"] == "running" else "cancelled"
-        connection.execute("UPDATE compute_tasks SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, task["id"]))
+    def _snapshot(repository: ComputeRepository, task_ids: list[int]) -> list[dict[str, Any]]:
+        refs: list[dict[str, Any]] = []
+        for task_id in task_ids:
+            task = repository.task_by_id(task_id)
+            if task is None:
+                raise NotFoundError(f"计算任务 {task_id} 不存在")
+            refs.append({"task_id": task_id, "version": int(task["version"])})
+        return refs
+
+    @staticmethod
+    def _apply_mutation(connection: sqlite3.Connection, task: sqlite3.Row, action: str, payload: dict[str, Any], now: str, actor: str, reason: str) -> None:
+        if action == "priority":
+            _mutate_priority(connection, task, now, int(payload["priority"]))
+        elif action in {"retry", "batch_retry"}:
+            _mutate_retry(connection, task, now, payload.get("priority"))
+        elif action == "cancel":
+            _mutate_cancel(connection, task, now)
+        elif action == "force_terminate":
+            _mutate_force_terminate(connection, task, now)
+        elif action == "result_withdraw":
+            _mutate_result_withdraw(connection, task, now, int(payload["result_version"]), actor, reason)
+        else:
+            raise ValidationError(f"不支持的审批操作类型：{action}")
+
+    @staticmethod
+    def _request_view(row: sqlite3.Row) -> dict[str, Any]:
+        view = dict(row)
+        view["payload"] = json.loads(view.pop("payload_json"))
+        view["task_refs"] = json.loads(view.pop("task_refs_json"))
+        view["execution"] = json.loads(view.pop("execution_json") or "{}")
+        return view
 
     def _check_quota(self, repository: ComputeRepository, requested_by: str, now: datetime) -> None:
         quota = repository.quota("user", requested_by)

@@ -80,3 +80,32 @@ class BatchOperation(BaseModel):
         if self.operation == "priority" and self.priority is None:
             raise ValueError("批量调整优先级时必须提供 priority")
         return self
+
+
+class ForceTerminateRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class WithdrawResultRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=2, max_length=1000)
+    result_version: int = Field(ge=1)
+
+
+class ApprovalPolicyUpdate(BaseModel):
+    priority_threshold: int | None = Field(default=None, ge=0, le=100)
+    batch_retry_min_size: int | None = Field(default=None, ge=1, le=200)
+    force_terminate_requires_approval: bool | None = None
+    result_withdraw_requires_approval: bool | None = None
+    request_ttl_seconds: int | None = Field(default=None, ge=60, le=86400)
+
+
+class ApprovalDecision(BaseModel):
+    approver: str = Field(min_length=1, max_length=120)
+    decision: Literal["approve", "reject"]
+    reason: str = Field(default="", max_length=1000)
+
+
+class ApprovalActor(BaseModel):
+    actor: str = Field(min_length=1, max_length=120)
